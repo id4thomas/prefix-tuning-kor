@@ -1,58 +1,31 @@
 import torch
 from torch import nn
-from transformers import AutoTokenizer, GPT2LMHeadModel
+from transformers import AutoTokenizer, AutoModelForCausalLM, GPTNeoXForCausalLM
 
-# 정상적 generate 위해 prepare_inputs_for_generation 부분을 조정해서 정상적으로
-class myGPT2LMHeadModel(GPT2LMHeadModel):
-    def prepare_inputs_for_generation(self, input_ids, past=None, **kwargs):
-        token_type_ids = kwargs.get("token_type_ids", None)
-        # only last token for inputs_ids if past is defined in kwargs
+class myGPTNeoXForCausalLM(GPTNeoXForCausalLM):
+    # need to override prepare_inputs_for_generation - past_key_values kwargs key error
+    def prepare_inputs_for_generation(self, input_ids, past_key_values = None, past=None, attention_mask=None, **model_kwargs):
+        input_shape = input_ids.shape
 
-        if past:
-            input_ids = input_ids[:, -1].unsqueeze(-1)
-            if token_type_ids is not None:
-                token_type_ids = token_type_ids[:, -1].unsqueeze(-1)
+        if attention_mask is None:
+            attention_mask = input_ids.new_ones(input_shape)
 
-        attention_mask = kwargs.get("attention_mask", None)
-        position_ids = kwargs.get("position_ids", None)
-        ##############################
         if past is None:
-            # print('only at the beginnning. ')
-            if 'past_key_values' in kwargs:
-                past = kwargs['past_key_values']
-            else:
-                past = None
+            past = past_key_values
 
-        if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-        else:
-            position_ids = None
-
-        # PREFIX 길이 만큼 attention_mask를 조정해준다.
-        # ex. prefix 길이 8, input_ids 길이 26이라면
-        # attention_mask는 34, position_ids는 26이 되어야함.
-        # attention_mask는 query*key^T 곱 이후에 반영되기 때문에 prefix 길이 필요
+        # attention_mask is applied after q*k^T
+        # attention_mask should be length prefix_len + input_ids length
         if past is not None and attention_mask is not None:
-            prefix_len = past[0].shape[-2]
+            prefix_len = past[0][0].shape[-2]
             bsz = input_ids.shape[0]
             device = attention_mask.device
             prefix_attention_mask = torch.ones(bsz, prefix_len)
             attention_mask = attention_mask.detach().cpu()
             attention_mask = torch.cat([prefix_attention_mask, attention_mask], dim = -1).to(device)
 
-        return {
-            "input_ids": input_ids,
-            "past_key_values": past,
-            "use_cache": kwargs.get("use_cache"),
-            "position_ids": position_ids,
-            "attention_mask": attention_mask,
-            "token_type_ids": token_type_ids,
-        }
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "past_key_values": past, **model_kwargs}
 
-# class PrefixGPT2LMHeadModel(PushToHubFriendlyModel):
-class PrefixGPT2LMHeadModel(nn.Module):
+class PrefixGPTNeoXLMHeadModel(nn.Module):
     main_input_name = "input_ids"
     def __init__(self, args):
         super().__init__()
@@ -65,21 +38,18 @@ class PrefixGPT2LMHeadModel(nn.Module):
         print("prefix-tuning sequence length is {}.".format(self.preseqlen))
 
         # Load tokenizer and model.
-        # self.tokenizer = AutoTokenizer.from_pretrained(args.pretrained_location, use_fast=False)
-        # KoGPT2 special_tokens 반영해서 로드
-        self.tokenizer = AutoTokenizer.from_pretrained(args.pretrained_location,
-                    bos_token='<s>', eos_token='</s>', unk_token='<unk>',
-                    pad_token='<pad>', mask_token='<mask>')
+        self.tokenizer = AutoTokenizer.from_pretrained(args.pretrained_location)
 
-        self.pretrain_model = myGPT2LMHeadModel.from_pretrained(
+        self.pretrain_model = myGPTNeoXForCausalLM.from_pretrained(
             args.pretrained_location
         )
+
         self.config = self.pretrain_model.config
 
-        # Parameter follows skt/kogpt2-base-v2
-        self.match_n_layer = self.config.n_layer
-        self.match_n_head = self.config.n_head
-        self.n_embd = self.config.n_embd
+        # Parameter follows eluetherai/polyglot
+        self.match_n_layer = self.config.num_hidden_layers
+        self.match_n_head = self.config.num_attention_heads
+        self.n_embd = self.config.hidden_size
         assert self.n_embd % self.match_n_head == 0
         self.match_n_embd = self.n_embd // self.match_n_head # huggingface BART's dim of kv need to be calculated
 
@@ -123,9 +93,9 @@ class PrefixGPT2LMHeadModel(nn.Module):
         return past_key_values
 
     def forward(self,
-                input_ids,
-                attention_mask,
-                labels,
+                input_ids = None,
+                attention_mask = None,
+                labels = None,
                 **kwargs,
                 ):
         bsz = input_ids.shape[0]
@@ -134,18 +104,26 @@ class PrefixGPT2LMHeadModel(nn.Module):
             bsz=bsz
         )
 
-        loss = self.pretrain_model(
+        # Make Prefix Attention mask
+        if not attention_mask is None:
+            device = attention_mask.device
+            prefix_attention_mask = torch.ones(bsz, self.preseqlen)
+            attention_mask = attention_mask.detach().cpu()
+            attention_mask = torch.cat([prefix_attention_mask, attention_mask], dim = -1).to(device)
+
+        outputs = self.pretrain_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
             past_key_values=past_prompt,
             **kwargs,
-        ).loss
-        return {'loss': loss, "logits": outputs.logits}
+        )
+
+        return {'loss': outputs.loss, "logits": outputs.logits}
 
     def generate(self,
                  input_ids,
-                 attention_mask,
+                 attention_mask = None,
                  **kwargs):
 
         bsz = input_ids.shape[0]
@@ -153,6 +131,7 @@ class PrefixGPT2LMHeadModel(nn.Module):
         past_prompt = self.get_prompt(
             bsz=bsz, sample_size=kwargs['num_beams']
         )
+
         generated_ids = self.pretrain_model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
